@@ -1,0 +1,624 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters: 
+    Bucket1:
+        Type: "String"
+        Default: "b1cf"
+    Bucket2: 
+        Type: "String"
+        Default: "b2cf"
+    LF1: 
+        Type: "String"
+        Default: "lf1cf"
+    LF2: 
+        Type: "String"
+        Default: "lf2cf"
+    ApiGateway: 
+        Type: "String"
+        Default: "photo search cf"
+    RoleForApiGateway: 
+        Type: "String"
+        Default: "apigateway-cf"
+    RoleForLF1: 
+        Type: "String"
+        Default: "index-photos-cf"
+    RoleForLF2: 
+        Type: "String"
+        Default: "search-photos-cf"
+    OpenSearchDomain: 
+        Type: "String"
+        Default: "photos-cf"
+Metadata:
+    Generator: "former2"
+Description: ""
+Resources:
+    S3Bucket:
+        DeletionPolicy: "Retain"
+        Type: "AWS::S3::Bucket"
+        Properties:
+            BucketName: !Sub "${Bucket1}"
+            VersioningConfiguration: 
+                Status: "Suspended"
+            WebsiteConfiguration: 
+                IndexDocument: "chat.html"
+
+    S3Bucket2:
+        DeletionPolicy: "Retain"
+        DependsOn: "LambdaPermission"
+        Type: "AWS::S3::Bucket"
+        Properties:
+            BucketName: !Sub "${Bucket2}"
+            CorsConfiguration: 
+                CorsRules: 
+                  - 
+                    AllowedHeaders: 
+                      - "*"
+                    AllowedMethods: 
+                      - "PUT"
+                      - "GET"
+                    AllowedOrigins: 
+                      - "*"
+            NotificationConfiguration: 
+                LambdaConfigurations: 
+                  - 
+                    Event: "s3:ObjectCreated:Put"
+                    Function: !GetAtt LambdaFunction.Arn
+            VersioningConfiguration: 
+                Status: "Suspended"
+    
+    S3BucketPolicy:
+        Type: "AWS::S3::BucketPolicy"
+        Properties:
+            Bucket: !Ref S3Bucket
+            PolicyDocument: 
+                Version: "2012-10-17"
+                Statement: 
+                  - 
+                    Sid: "PublicReadGetObject"
+                    Effect: "Allow"
+                    Principal: "*"
+                    Action: "s3:*"
+                    Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
+
+    S3BucketPolicy2:
+        Type: "AWS::S3::BucketPolicy"
+        Properties:
+            Bucket: !Ref S3Bucket2
+            PolicyDocument: 
+                Version: "2012-10-17"
+                Statement: 
+                  - 
+                    Sid: "PublicReadGetObject"
+                    Effect: "Allow"
+                    Principal: "*"
+                    Action: "s3:*"
+                    Resource: !Sub "arn:aws:s3:::${S3Bucket2}/*"
+    
+    LambdaPermission:
+        Type: "AWS::Lambda::Permission"
+        Properties:
+            Action: "lambda:InvokeFunction"
+            FunctionName: !GetAtt LambdaFunction.Arn
+            Principal: "s3.amazonaws.com"
+            SourceArn: !Sub "arn:aws:s3:::${Bucket2}"
+    
+    LambdaPermission2:
+        Type: "AWS::Lambda::Permission"
+        Properties:
+            Action: "lambda:InvokeFunction"
+            FunctionName: !GetAtt LambdaFunction2.Arn
+            Principal: "apigateway.amazonaws.com"
+            SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*/GET/search"
+
+    LambdaPermission3:
+        Type: "AWS::Lambda::Permission"
+        Properties:
+            Action: "lambda:InvokeFunction"
+            FunctionName: !GetAtt LambdaFunction2.Arn
+            Principal: "apigateway.amazonaws.com"
+            SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*/OPTIONS/search"
+
+    LambdaFunction:
+        DeletionPolicy: "Retain"
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Description: ""
+            FunctionName: !Sub "${LF1}"
+            Handler: "index.lambda_handler"
+            Architectures: 
+              - "x86_64"
+            Code: 
+              ZipFile: |
+                import json
+                import boto3
+                import io
+                from datetime import datetime
+                import urllib.parse
+                from requests_aws4auth import AWS4Auth
+                import requests
+                import base64
+
+
+                def lambda_handler(event, context):
+                    # return {
+                    # "statusCode": 200,
+                    # "headers": { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+                    # "body": json.dumps(event['queryStringParameters'])}
+
+                    # { "type": "unstructured",
+                    #   "unstructured": {
+                    #   "text": i['content'],}
+                    # }
+
+                    # lex bot parsig sentences
+                    chatbot = boto3.client('lexv2-runtime')
+                    response = chatbot.recognize_text(
+                        botId="23UASWBATI",
+                        botAliasId="TSTALIASID",
+                        localeId='en_US',
+                        sessionId="90267227652285",
+                        text=event['queryStringParameters']['q'])
+
+                    labels = response['messages'][0]['content'].split()
+
+                    # open search
+                    region = 'us-east-1'
+                    service = 'es'
+                    credentials = boto3.Session().get_credentials()
+                    awsauth = AWS4Auth(credentials.access_key, credentials.secret_key, region, service, session_token=credentials.token)
+
+                    host = 'https://search-photos-wwabll457m6pbqsqqfsgz7qjq4.us-east-1.es.amazonaws.com'
+                    index = 'photos'
+                    type = '_doc'
+                    url = host + '/' + index + '/' + type + '/_search?' + "q=labels:"
+                    id_list = set()
+
+                    for l in labels:
+                        if l[-1]=="s":
+                            l=l[:-1]
+                        r = requests.get(url + l, auth=awsauth)
+                        response = r.json()
+                        for photo in response['hits']['hits']:
+                            id_list.add(photo['_source']['objectKey'])
+
+                    # get files from s3
+                    s3 = boto3.client('s3')
+                    bucket = "6998as2b2"
+                    imgs = []
+
+                    for i in id_list:
+                        fileObj = s3.get_object(Bucket=bucket, Key=i)
+                        file_content = fileObj["Body"].read()
+                        imgs.append(base64.b64encode(file_content).decode('utf-8'))
+
+                    return {
+                        "statusCode": 200,
+                        "headers": {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                        'body': json.dumps(imgs),
+                    }
+            MemorySize: 128
+            Role: !GetAtt IAMRole3.Arn
+            Runtime: "python3.9"
+            Timeout: 120
+            TracingConfig: 
+                Mode: "PassThrough"
+            EphemeralStorage: 
+                Size: 512
+
+    LambdaFunction2:
+        DeletionPolicy: "Retain"
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Description: ""
+            FunctionName: !Sub "${LF2}"
+            Handler: "index.lambda_handler"
+            Architectures: 
+              - "x86_64"
+            Code: 
+              ZipFile: |
+                import json
+                import boto3
+                import io
+                import urllib.parse
+                from datetime import datetime
+                from requests_aws4auth import AWS4Auth
+                import requests
+
+
+                def lambda_handler(event, context):
+                    key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+                    rekog = boto3.client("rekognition")
+                    s3 = boto3.client('s3')
+                    bucket = "6998as2b2"
+
+                    fileObj = s3.get_object(Bucket=bucket, Key=key)
+                    file_content = fileObj["Body"].read()
+                    rekog_response = rekog.detect_labels(Image={"Bytes": file_content}, MaxLabels=3, MinConfidence=70)
+                    rekog_labels = list(map(lambda label: label['Name'].lower(), rekog_response["Labels"]))
+
+                    s3_response = s3.head_object(Bucket=bucket, Key=key)
+                    if "customlabels" in s3_response["Metadata"]:
+                        s3_raw_labels = s3_response["Metadata"]["customlabels"].lower().split(", ")
+                    else:
+                        s3_raw_labels = []
+
+                    labels = list(set(rekog_labels + s3_raw_labels))
+
+                    region = 'us-east-1'
+                    service = 'es'
+                    credentials = boto3.Session().get_credentials()
+                    awsauth = AWS4Auth(credentials.access_key, credentials.secret_key, region, service, session_token=credentials.token)
+
+                    host = 'https://search-photos-wwabll457m6pbqsqqfsgz7qjq4.us-east-1.es.amazonaws.com'
+                    index = 'photos'
+                    type = '_doc'
+                    url = host + '/' + index + '/' + type
+                    headers = {"Content-Type": "application/json"}
+
+                    document = {
+                        "objectKey": key,
+                        "bucket": bucket,
+                        "createdTimestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                        "labels": labels
+                    }
+                    r = requests.post(url, auth=awsauth, json=document, headers=headers)
+
+                    return {
+                        'headers': {"Content-Type": "image/jpg"},
+                        'statusCode': 200,
+                        'body': 1,
+                        'labels': labels
+                    }
+            MemorySize: 128
+            Role: !GetAtt IAMRole2.Arn
+            Runtime: "python3.9"
+            Timeout: 180
+            TracingConfig: 
+                Mode: "PassThrough"
+            EphemeralStorage: 
+                Size: 512
+
+    ApiGatewayRestApi:
+        Type: "AWS::ApiGateway::RestApi"
+        Properties:
+            Name: !Sub "${ApiGateway}"
+            Description: "This is initialized by cloud formation"
+            ApiKeySourceType: "HEADER"
+            BinaryMediaTypes: 
+              - "image/jpeg"
+              - "image/png"
+            EndpointConfiguration: 
+                Types: 
+                  - "REGIONAL"
+
+    ApiGatewayResource:
+        Type: "AWS::ApiGateway::Resource"
+        Properties:
+            RestApiId: !Ref ApiGatewayRestApi
+            PathPart: "search"
+            ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+
+    ApiGatewayResource2:
+        Type: "AWS::ApiGateway::Resource"
+        Properties:
+            RestApiId: !Ref ApiGatewayRestApi
+            PathPart: "upload"
+            ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+
+    ApiGatewayResource3:
+        Type: "AWS::ApiGateway::Resource"
+        Properties:
+            RestApiId: !Ref ApiGatewayRestApi
+            PathPart: "{folder}"
+            ParentId: !Ref ApiGatewayResource2
+
+    ApiGatewayResource4:
+        Type: "AWS::ApiGateway::Resource"
+        Properties:
+            RestApiId: !Ref ApiGatewayRestApi
+            PathPart: "{object}"
+            ParentId: !Ref ApiGatewayResource3
+
+    ApiGatewayModel:
+        Type: "AWS::ApiGateway::Model"
+        Properties:
+            RestApiId: !Ref ApiGatewayRestApi
+            Name: "SearchResponse"
+            Schema: !Sub |
+                {
+                  "type" : "object",
+                  "properties" : {
+                    "results" : {
+                      "type" : "array",
+                      "items" : {
+                        "$ref":"https://apigateway.amazonaws.com/restapis/${ApiGatewayRestApi}/models/${ApiGatewayModel2}"
+                      }
+                    }
+                  }
+                }
+            ContentType: "application/json"
+
+    ApiGatewayModel2:
+        Type: "AWS::ApiGateway::Model"
+        Properties:
+            RestApiId: !Ref ApiGatewayRestApi
+            Name: "Photo"
+            Schema: |
+                {
+                  "type" : "object",
+                  "properties" : {
+                    "url" : {
+                      "type" : "string"
+                    },
+                    "labels" : {
+                      "type" : "array",
+                      "items" : {
+                        "type" : "string"
+                      }
+                    }
+                  }
+                }
+            ContentType: "application/json"
+
+    ApiGatewayMethod:
+        Type: "AWS::ApiGateway::Method"
+        Properties:
+            RestApiId: !Ref ApiGatewayRestApi
+            ResourceId: !Ref ApiGatewayResource
+            HttpMethod: "OPTIONS"
+            AuthorizationType: "NONE"
+            ApiKeyRequired: false
+            RequestParameters: {}
+            RequestModels: {}
+            MethodResponses: 
+              - 
+                ResponseModels: {}
+                ResponseParameters: 
+                    "method.response.header.Access-Control-Allow-Headers": false
+                    "method.response.header.Access-Control-Allow-Methods": false
+                    "method.response.header.Access-Control-Allow-Origin": false
+                StatusCode: "200"
+            Integration: 
+                CacheNamespace: !Ref ApiGatewayResource
+                ContentHandling: "CONVERT_TO_TEXT"
+                IntegrationHttpMethod: "POST"
+                IntegrationResponses: 
+                  - 
+                    ResponseParameters: 
+                        "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                        "method.response.header.Access-Control-Allow-Methods": "'GET,OPTIONS'"
+                        "method.response.header.Access-Control-Allow-Origin": "'*'"
+                    ResponseTemplates: {}
+                    StatusCode: "200"
+                PassthroughBehavior: "WHEN_NO_MATCH"
+                RequestParameters: {}
+                RequestTemplates: {}
+                TimeoutInMillis: 29000
+                Type: "AWS"
+                Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaFunction2}/invocations"
+
+    ApiGatewayMethod2:
+        Type: "AWS::ApiGateway::Method"
+        Properties:
+            RestApiId: !Ref ApiGatewayRestApi
+            ResourceId: !Ref ApiGatewayResource
+            HttpMethod: "GET"
+            AuthorizationType: "NONE"
+            ApiKeyRequired: false
+            OperationName: "searchPhotos"
+            RequestParameters: 
+                "method.request.querystring.q": false
+            RequestModels: {}
+            MethodResponses: 
+              - 
+                ResponseModels: 
+                    "application/json": !Ref ApiGatewayModel
+                ResponseParameters: 
+                    "method.response.header.Access-Control-Allow-Origin": false
+                StatusCode: "200"
+              - 
+                ResponseModels: 
+                    "application/json": "Error"
+                ResponseParameters: {}
+                StatusCode: "403"
+              - 
+                ResponseModels: 
+                    "application/json": "Error"
+                ResponseParameters: {}
+                StatusCode: "500"
+            Integration: 
+                CacheNamespace: !Ref ApiGatewayResource
+                ContentHandling: "CONVERT_TO_TEXT"
+                IntegrationHttpMethod: "POST"
+                IntegrationResponses: 
+                  - 
+                    ResponseParameters: 
+                        "method.response.header.Access-Control-Allow-Origin": "'*'"
+                    ResponseTemplates: {}
+                    StatusCode: "200"
+                PassthroughBehavior: "WHEN_NO_MATCH"
+                RequestParameters: {}
+                RequestTemplates: {}
+                TimeoutInMillis: 29000
+                Type: "AWS_PROXY"
+                Uri: !Sub >-
+                  arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction2.Arn}/invocations
+
+            # Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaFunction2}/invocations"
+
+    ApiGatewayMethod3:
+        Type: "AWS::ApiGateway::Method"
+        Properties:
+            RestApiId: !Ref ApiGatewayRestApi
+            ResourceId: !Ref ApiGatewayResource4
+            HttpMethod: "PUT"
+            AuthorizationType: "NONE"
+            ApiKeyRequired: false
+            RequestParameters: 
+                "method.request.header.Content-Type": true
+                "method.request.header.x-amz-meta-customLabels": true
+                "method.request.path.folder": true
+                "method.request.path.object": true
+            RequestModels: {}
+            MethodResponses: 
+              - 
+                ResponseModels: {}
+                ResponseParameters: 
+                    "method.response.header.Access-Control-Allow-Origin": false
+                StatusCode: "200"
+            Integration: 
+                CacheNamespace: !Ref ApiGatewayResource4
+                Credentials: !Sub "arn:aws:iam::${AWS::AccountId}:role/apigateway"
+                IntegrationHttpMethod: "PUT"
+                IntegrationResponses: 
+                  - 
+                    ResponseParameters: 
+                        "method.response.header.Access-Control-Allow-Origin": "'*'"
+                    ResponseTemplates: {}
+                    StatusCode: "200"
+                PassthroughBehavior: "WHEN_NO_MATCH"
+                RequestParameters: 
+                    "integration.request.header.Content-Type": "method.request.header.Content-Type"
+                    "integration.request.header.x-amz-meta-customLabels": "method.request.header.x-amz-meta-customLabels"
+                    "integration.request.path.bucket": "method.request.path.folder"
+                    "integration.request.path.key": "method.request.path.object"
+                RequestTemplates: {}
+                TimeoutInMillis: 29000
+                Type: "AWS"
+                Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/{bucket}/{key}"
+
+    ApiGatewayMethod4:
+        Type: "AWS::ApiGateway::Method"
+        Properties:
+            RestApiId: !Ref ApiGatewayRestApi
+            ResourceId: !Ref ApiGatewayResource4
+            HttpMethod: "OPTIONS"
+            AuthorizationType: "NONE"
+            ApiKeyRequired: false
+            RequestParameters: {}
+            RequestModels: {}
+            MethodResponses: 
+              - 
+                ResponseModels: {}
+                ResponseParameters: 
+                    "method.response.header.Access-Control-Allow-Headers": false
+                    "method.response.header.Access-Control-Allow-Methods": false
+                    "method.response.header.Access-Control-Allow-Origin": false
+                StatusCode: "200"
+            Integration: 
+                CacheNamespace: !Ref ApiGatewayResource4
+                IntegrationResponses: 
+                  - 
+                    ResponseParameters: 
+                        "method.response.header.Access-Control-Allow-Headers": "'*'"
+                        "method.response.header.Access-Control-Allow-Methods": "'OPTIONS,PUT'"
+                        "method.response.header.Access-Control-Allow-Origin": "'*'"
+                    ResponseTemplates: {}
+                    StatusCode: "200"
+                PassthroughBehavior: "WHEN_NO_MATCH"
+                RequestParameters: {}
+                RequestTemplates: 
+                    "application/json": "{\"statusCode\": 200}"
+                TimeoutInMillis: 29000
+                Type: "MOCK"
+
+    IAMRole:
+        DeletionPolicy: "Retain"
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: "/"
+            RoleName: !Sub "${RoleForApiGateway}"
+            AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"\",\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"apigateway.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+            MaxSessionDuration: 3600
+            ManagedPolicyArns: 
+              - "arn:aws:iam::aws:policy/AmazonAPIGatewayAdministrator"
+              - "arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+              - "arn:aws:iam::aws:policy/CloudWatchLogsFullAccess"
+              - "arn:aws:iam::aws:policy/CloudWatchFullAccess"
+              - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+            Description: "Allows API Gateway to push logs to CloudWatch Logs."
+     
+    IAMRole2:
+        DeletionPolicy: "Retain"
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: "/service-role/"
+            RoleName: !Sub "${RoleForLF1}"
+            AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+            MaxSessionDuration: 3600
+            ManagedPolicyArns: 
+              - "arn:aws:iam::aws:policy/AmazonLexFullAccess"
+              - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+              - "arn:aws:iam::aws:policy/AmazonOpenSearchServiceFullAccess"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:policy/service-role/AWSLambdaBasicExecutionRole-64e49806-7fe8-4043-ae08-4797ff1152df"
+
+    IAMRole3:
+        DeletionPolicy: "Retain"
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: "/service-role/"
+            RoleName: !Sub "${RoleForLF2}"
+            AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+            MaxSessionDuration: 3600
+            ManagedPolicyArns: 
+              - "arn:aws:iam::aws:policy/AmazonVPCCrossAccountNetworkInterfaceOperations"
+              - "arn:aws:iam::aws:policy/AWSLambdaExecute"
+              - "arn:aws:iam::aws:policy/AmazonRekognitionFullAccess"
+              - "arn:aws:iam::aws:policy/AmazonSQSFullAccess"
+              - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+              - "arn:aws:iam::aws:policy/AWSNetworkManagerFullAccess"
+              - "arn:aws:iam::aws:policy/AmazonOpenSearchServiceFullAccess"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:policy/service-role/AWSLambdaBasicExecutionRole-4d88c830-4f0f-4160-9eed-6262cf5d4bf1"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:policy/CodePipelineLambdaExecPolicy"
+
+    OpenSearchServiceDomain:
+        DeletionPolicy: "Retain"
+        Type: "AWS::OpenSearchService::Domain"
+        Properties:
+            DomainName: !Sub "${OpenSearchDomain}"
+            EngineVersion: "OpenSearch_1.3"
+            AccessPolicies:
+                Version: '2012-10-17'
+                Statement:
+                    -
+                        Effect: 'Allow'
+                        Principal:
+                            AWS: '*'
+                        Action: 'es:*'
+                        Resource: !Sub "arn:aws:es:us-east-1:902672276522:domain/${OpenSearchDomain}/*"            
+            ClusterConfig: 
+                DedicatedMasterEnabled: false
+                InstanceCount: 3
+                InstanceType: "t3.small.search"
+                ZoneAwarenessEnabled: true
+                ZoneAwarenessConfig: 
+                    AvailabilityZoneCount: 3
+                WarmEnabled: false
+            EncryptionAtRestOptions: 
+                Enabled: true
+                KmsKeyId: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/2a9198ee-8aba-4b00-85f9-00bc1eb345d0"
+            NodeToNodeEncryptionOptions: 
+                Enabled: true
+            AdvancedOptions: 
+                "indices.fielddata.cache.size": "20"
+                "indices.query.bool.max_clause_count": "1024"
+                override_main_response_version: "false"
+                "rest.action.multi.allow_explicit_index": "true"
+            EBSOptions: 
+                EBSEnabled: true
+                VolumeType: "gp3"
+                VolumeSize: 10
+                Iops: 3000
+                Throughput: 125
+            CognitoOptions: 
+                Enabled: false
+            DomainEndpointOptions: 
+                EnforceHTTPS: true
+                TLSSecurityPolicy: "Policy-Min-TLS-1-0-2019-07"
+                CustomEndpointEnabled: false
+            AdvancedSecurityOptions: 
+                Enabled: true
+                InternalUserDatabaseEnabled: true
+                MasterUserOptions: 
+                  MasterUserName: "zwxzwxee"
+                  MasterUserPassword: "Zwxangel.72700"
+
